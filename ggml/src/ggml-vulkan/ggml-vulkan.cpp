@@ -2497,6 +2497,11 @@ static constexpr uint32_t RDNA_DEFAULT_SUBGROUP_SIZE = 32;
 // Define configurations for different GPUs.
 static std::vector<GpuPipelineConfig> gpu_pipeline_configs = {
     {
+        vk_device_architecture::AMD_GCN,
+        {},   // no per-pipeline overrides; GCN uses fixed wavefront of 64
+        64    // default_subgroup_size = wavefront size
+    },
+    {
         vk_device_architecture::AMD_RDNA1,
         {
             rdna1_pipelines,
@@ -4098,6 +4103,36 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device->max_buffer_size = device->max_memory_allocation_size;
         }
 
+#ifdef __APPLE__
+        // MoltenVK on non-Apple GPUs returns 0 for maxMemoryAllocationSize and
+        // maxBufferSize at runtime even though vulkaninfo shows correct values.
+        // Fall back to the largest heap size so buffer allocations are not blocked.
+        if (device->max_memory_allocation_size == 0 || device->max_buffer_size == 0) {
+            // MoltenVK returns 0 for maxMemoryAllocationSize / maxBufferSize at
+            // runtime even though `vulkaninfo` reports correct limits.  This is a
+            // MoltenVK bug: the values are populated correctly during device
+            // enumeration but come back as zero once the Vulkan application context
+            // is fully initialised on non-Apple GPU paths.  Without this fallback
+            // suballocation_block_size is clamped to 0 and every allocation fails.
+            GGML_LOG_WARN("ggml_vulkan: MoltenVK returned maxMemoryAllocationSize=0 or "
+                          "maxBufferSize=0 at runtime (vulkaninfo shows correct values). "
+                          "Falling back to largest heap size.\n");
+            const vk::PhysicalDeviceMemoryProperties mem_props =
+                device->physical_device.getMemoryProperties();
+            uint64_t max_heap = 0;
+            for (uint32_t i = 0; i < mem_props.memoryHeapCount; i++) {
+                max_heap = std::max(max_heap,
+                                    static_cast<uint64_t>(mem_props.memoryHeaps[i].size));
+            }
+            if (device->max_memory_allocation_size == 0) {
+                device->max_memory_allocation_size = max_heap;
+            }
+            if (device->max_buffer_size == 0) {
+                device->max_buffer_size = max_heap;
+            }
+        }
+#endif
+
         const char* GGML_VK_SUBALLOCATION_BLOCK_SIZE = getenv("GGML_VK_SUBALLOCATION_BLOCK_SIZE");
 
         if (GGML_VK_SUBALLOCATION_BLOCK_SIZE != nullptr) {
@@ -4109,6 +4144,36 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->suballocation_block_size = std::min(device->suballocation_block_size, device->max_memory_allocation_size);
 
         device->subgroup_size = subgroup_props.subgroupSize;
+#ifdef __APPLE__
+        // MoltenVK on AMD GPUs: fix architecture classification and subgroup size.
+        // MoltenVK lacks VK_AMD_shader_core_properties, so get_device_architecture
+        // returns OTHER for all AMD hardware. All AMD GPUs shipped in Mac hardware
+        // (Polaris GCN, Vega GCN) have 64-wide wavefronts; reclassify them and
+        // patch the subgroupSize that MoltenVK incorrectly reports as 0.
+        if (device->vendor_id == VK_VENDOR_ID_AMD) {
+            if (device->architecture == vk_device_architecture::OTHER) {
+                // MoltenVK does not expose VK_AMD_shader_core_properties, so
+                // get_device_architecture() returns OTHER for all AMD discrete GPUs.
+                // AMD hardware shipped in Mac systems (Polaris/GCN, Vega/GCN) uses
+                // 64-wide wavefronts; reclassify so pipeline configs use the correct
+                // warptile dimensions instead of the generic OTHER fallback.
+                GGML_LOG_WARN("ggml_vulkan: MoltenVK lacks VK_AMD_shader_core_properties; "
+                              "reclassifying AMD device as AMD_GCN (64-wide wavefront).\n");
+                device->architecture = vk_device_architecture::AMD_GCN;
+            }
+            if (device->subgroup_size == 0 &&
+                device->architecture == vk_device_architecture::AMD_GCN) {
+                // MoltenVK reports subgroupSize=0 for AMD GCN via
+                // VkPhysicalDeviceSubgroupProperties even though the hardware has a
+                // fixed 64-wide wavefront.  The correct size can be inferred from
+                // VkPhysicalDeviceSubgroupSizeControlPropertiesEXT (min=max=64)
+                // which MoltenVK does populate correctly.
+                GGML_LOG_WARN("ggml_vulkan: MoltenVK reported subgroupSize=0 for AMD GCN; "
+                              "patching to 64 (fixed wavefront width).\n");
+                device->subgroup_size = 64;
+            }
+        }
+#endif
         device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
         if (sm_builtins) {
             device->shader_core_count = sm_props.shaderSMCount;
@@ -4277,6 +4342,14 @@ static vk_device ggml_vk_get_device(size_t idx) {
         // features we actually need and know MoltenVK supports on non-Apple GPUs.
         // fp16 remains enabled through the VK_KHR_shader_float16_int8 extension path.
         if (device->vendor_id != VK_VENDOR_ID_APPLE) {
+            // MoltenVK on non-Apple AMD GPUs rejects VK1.1/VK1.2 core features at
+            // vkCreateDevice (VK_ERROR_FEATURE_NOT_PRESENT) even though they were
+            // reported available by vkGetPhysicalDeviceFeatures2.  Additionally, long
+            // pNext chains cause incorrect FALSE readings for supported features such
+            // as storageBuffer16BitAccess.  Re-query with isolated single-struct chains
+            // to get accurate values, then zero the main structs before createDevice.
+            GGML_LOG_WARN("ggml_vulkan: MoltenVK non-Apple GPU: re-querying VK1.1/VK1.2 "
+                          "features with isolated chains to avoid vkCreateDevice rejection.\n");
             // Two separate single-struct queries — MoltenVK fills storageBuffer16BitAccess
             // correctly only when vk11_features is the sole struct in the chain (pNext=null).
             // Chaining vk12_features after vk11_features causes MoltenVK to return FALSE
@@ -4809,7 +4882,15 @@ static void ggml_vk_print_gpu_info(size_t idx) {
 #endif
 
     uint32_t default_subgroup_size = get_subgroup_size("", device_architecture);
-    const size_t subgroup_size = (default_subgroup_size != 0) ? default_subgroup_size : subgroup_props.subgroupSize;
+    size_t subgroup_size = (default_subgroup_size != 0) ? default_subgroup_size : subgroup_props.subgroupSize;
+#ifdef __APPLE__
+    // MoltenVK lacks VK_AMD_shader_core_properties so get_device_architecture returns OTHER
+    // for AMD discrete GPUs, and subgroupSize comes back 0.  GCN hardware has a fixed 64-wide
+    // wavefront; patch the display value so the info line is accurate.
+    if (subgroup_size == 0 && props2.properties.vendorID == VK_VENDOR_ID_AMD) {
+        subgroup_size = 64;
+    }
+#endif
     const bool uma = props2.properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
 
     integer_dot_product = integer_dot_product
@@ -13355,6 +13436,21 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
 
             if (membudget_supported && i < budgetprops.heapUsage.size()) {
                 *free = budgetprops.heapBudget[i] - budgetprops.heapUsage[i];
+#ifdef __APPLE__
+                // MoltenVK on non-Apple GPUs (e.g. AMD Polaris) returns
+                // heapBudget=0 and heapUsage=0 via VkPhysicalDeviceMemoryBudgetPropertiesEXT
+                // at runtime even though vulkaninfo reports correct heap sizes.  This is a
+                // MoltenVK bug in its non-Apple GPU path: the budget extension is advertised
+                // but the values are not filled in.  Without this fallback the layer planner
+                // sees 0 MiB free and cannot schedule any GPU layers.
+                if (*free == 0 && heap.size > 0) {
+                    GGML_LOG_WARN("ggml_vulkan: MoltenVK heapBudget=0 for device-local heap "
+                                  "(VkPhysicalDeviceMemoryBudgetPropertiesEXT); "
+                                  "falling back to heap.size (%zu MiB).\n",
+                                  (size_t)(heap.size >> 20));
+                    *free = heap.size;
+                }
+#endif
             } else {
                 *free = heap.size;
             }
